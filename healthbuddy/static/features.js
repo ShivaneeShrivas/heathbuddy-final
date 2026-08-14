@@ -54,6 +54,11 @@ views.pc_setup = () => {
       }});
       rewardFeedback({ xp_earned: 0, new_badges: data.new_badges });
       toast("Period Care is on 🌸");
+      // If daily notifications are already on, re-fetch so tonight's/
+      // tomorrow's nudges can include a Period Care example instead of
+      // waiting for the next manual toggle-off/on. Best-effort — a failure
+      // here shouldn't block the save the user just made.
+      refreshLocalNotifsIfEnabled().catch(() => {});
       go("home");
     } catch (e) { err.textContent = e.message; }
   };

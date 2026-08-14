@@ -150,20 +150,43 @@ function logout() {
    goes through pushStatus()/enablePush()/disablePush() and doesn't need to
    know which mechanism is actually running underneath. */
 
-/* Fixed daily nudge times for the native build - one per SLOTS window in
-   services/notify.py. Local notifications can't fetch personalized content
-   at fire-time (the device may be offline), so each carries a small rotating
-   line in the same voice as the server-composed ones, picked once when
-   notifications are enabled. IDs are fixed so they can be found & cancelled. */
-const LOCAL_SLOTS = [
-  { id: 101, hour: 8, minute: 30, title: "☀️ Rise and shine",
-    body: "Before the chai, before the scroll — one glass of water first." },
-  { id: 102, hour: 13, minute: 30, title: "🪑 Chair check",
-    body: "You've been one with your chair since morning. Time to remind your legs they still work." },
-  { id: 103, hour: 18, minute: 30, title: "🧘 Stretch o'clock",
-    body: "Pause for 60 seconds and stretch. Your spine has been quietly judging you all day." },
-  { id: 104, hour: 21, minute: 30, title: "🌙 Wind-down nudge",
-    body: "Screens off in 20 minutes? Just as an experiment — see how you feel tomorrow." },
+/* Daily nudge times for the native build. Local notifications can't fetch
+   personalized content at fire-time (the device may be offline), so the
+   time slots are fixed clock times decided here, and personalizedLocalSlots()
+   below fills in the wording once, when notifications are (re)enabled.
+
+   Up to LOCAL_SLOT_COUNT/day, evenly spaced from 7:30 AM to 9:30 PM — inside
+   the app's default quiet hours (23:00-07:00) so a full 12/day schedule still
+   never buzzes overnight. Matches the hard cap in
+   services/notification_preview.py (MAX_DAILY_NOTIFICATIONS) — the two are
+   meant to move together if that number ever changes. IDs are fixed so
+   status checks & cancellation are reliable even on a day that only
+   schedules, say, 8 of the 12 (a profile with little home-screen data yet
+   won't have enough distinct content to fill all 12 without repeating). */
+const LOCAL_SLOT_COUNT = 12;
+const LOCAL_SLOT_ID_BASE = 101;
+
+function buildLocalSlotTimes(n) {
+  const startMin = 7 * 60 + 30;  // 7:30 AM
+  const endMin = 21 * 60 + 30;   // 9:30 PM
+  const span = endMin - startMin;
+  const times = [];
+  for (let i = 0; i < n; i++) {
+    const mins = n === 1 ? startMin : Math.round(startMin + (span * i) / (n - 1));
+    times.push({ id: LOCAL_SLOT_ID_BASE + i, hour: Math.floor(mins / 60), minute: mins % 60 });
+  }
+  return times;
+}
+
+const LOCAL_SLOT_TIMES = buildLocalSlotTimes(LOCAL_SLOT_COUNT);
+
+/* Only used if the personalization call fails outright (offline first
+   install, server hiccup) — still better than scheduling nothing that day. */
+const GENERIC_FALLBACK = [
+  { title: "☀️ Rise and shine", body: "Before the chai, before the scroll — one glass of water first." },
+  { title: "🪑 Chair check", body: "You've been one with your chair since morning. Time to remind your legs they still work." },
+  { title: "🧘 Stretch o'clock", body: "Pause for 60 seconds and stretch. Your spine has been quietly judging you all day." },
+  { title: "🌙 Wind-down nudge", body: "Screens off in 20 minutes? Just as an experiment — see how you feel tomorrow." },
 ];
 
 function nativeLocalNotifAvailable() {
@@ -192,7 +215,7 @@ async function localNotifStatus() {
     if (perm.display === "denied") return "denied";
     if (perm.display !== "granted") return "undecided";
     const pending = await LN.getPending();
-    const ids = new Set(LOCAL_SLOTS.map((s) => s.id));
+    const ids = new Set(LOCAL_SLOT_TIMES.map((s) => s.id));
     const scheduled = pending.notifications.some((n) => ids.has(n.id));
     return scheduled ? "on" : "off";
   } catch (e) {
@@ -235,6 +258,47 @@ async function pushStatus() {
   return nativeLocalNotifAvailable() ? localNotifStatus() : webPushStatus();
 }
 
+/* Ask the server for up to LOCAL_SLOT_COUNT real personalized examples for
+   today (goal + occupation + gender/Period Care + steps/water/meals/sleep/
+   mood streak — see services/notification_preview.py) and lay them onto
+   that many of the fixed daily clock times. Falls back to a short generic
+   set if the request fails (offline, server hiccup) so *something* still
+   gets scheduled either way. */
+
+/* The engine can return more goal/occupation/home-data/period_care examples
+   than fit, or (for a brand-new low-data profile) fewer than
+   LOCAL_SLOT_COUNT. Either way, Period Care is pinned into the schedule
+   whenever present rather than left to compete on plain ordering — it's
+   the signal most worth guaranteeing visibility for. */
+function pickForSlots(examples, n) {
+  const pc = examples.find((e) => e.tag === "period_care");
+  const rest = examples.filter((e) => e.tag !== "period_care");
+  const picked = pc ? [...rest.slice(0, n - 1), pc] : rest.slice(0, n);
+  return picked.length ? picked : examples.slice(0, n);
+}
+
+async function personalizedLocalSlots() {
+  try {
+    const { examples } = await api("/onboarding/preview",
+      { method: "POST", body: { count: LOCAL_SLOT_COUNT } });
+    if (!examples || !examples.length) throw new Error("no examples returned");
+    const picked = pickForSlots(examples, LOCAL_SLOT_COUNT);
+    // Schedule exactly as many slots as we have distinct content for -
+    // never pad by repeating a line just to hit 12; a repeated notification
+    // reads as a bug, not as personalization.
+    return LOCAL_SLOT_TIMES.slice(0, picked.length).map((slot, i) => {
+      const ex = picked[i];
+      return { id: slot.id, hour: slot.hour, minute: slot.minute,
+               title: `${ex.emoji} ${ex.title}`, body: ex.body };
+    });
+  } catch (e) {
+    console.error("[push] personalizedLocalSlots() failed, using generic wording:", e);
+    return LOCAL_SLOT_TIMES.slice(0, GENERIC_FALLBACK.length).map((slot, i) => ({
+      id: slot.id, hour: slot.hour, minute: slot.minute, ...GENERIC_FALLBACK[i],
+    }));
+  }
+}
+
 async function enableLocalNotifs() {
   const LN = window.__hbPlugin("LocalNotifications");
   if (!LN) { toast("Notifications plugin not available on this build."); return false; }
@@ -246,18 +310,42 @@ async function enableLocalNotifs() {
         : "No worries — you can turn this on later in Profile.");
       return false;
     }
+    // Clear the full fixed ID range first - if today's personalized batch
+    // is smaller than a previous day's (e.g. less home data logged so far),
+    // stale extra notifications from before must not linger.
+    await LN.cancel({ notifications: LOCAL_SLOT_TIMES.map((s) => ({ id: s.id })) });
+    const slots = await personalizedLocalSlots();
     await LN.schedule({
-      notifications: LOCAL_SLOTS.map((s) => ({
+      notifications: slots.map((s) => ({
         id: s.id, title: s.title, body: s.body,
         schedule: { on: { hour: s.hour, minute: s.minute }, allowWhileIdle: true },
       })),
     });
-    toast("Notifications on 🔔 — daily nudges at set times, even with the app closed.");
+    toast(`Notifications on 🔔 — ${slots.length} personalized nudges today, even with the app closed.`);
     return true;
   } catch (e) {
     toast("Couldn't turn on notifications: " + e.message);
     return false;
   }
+}
+
+/* Re-fetch and re-schedule with fresh personalized content. Call this after
+   onboarding changes (new goal picked, Period Care just enabled) or once a
+   day (e.g. from the home-screen pull-to-refresh) — otherwise the local
+   notifications keep the wording (and count) from whenever they were last
+   enabled, since they fire fully offline and can't reach the server at
+   fire-time. */
+async function refreshLocalNotifsIfEnabled() {
+  const LN = window.__hbPlugin("LocalNotifications");
+  if (!LN || (await localNotifStatus()) !== "on") return;
+  await LN.cancel({ notifications: LOCAL_SLOT_TIMES.map((s) => ({ id: s.id })) });
+  const slots = await personalizedLocalSlots();
+  await LN.schedule({
+    notifications: slots.map((s) => ({
+      id: s.id, title: s.title, body: s.body,
+      schedule: { on: { hour: s.hour, minute: s.minute }, allowWhileIdle: true },
+    })),
+  });
 }
 
 /* Must be called from a direct user click - browsers silently ignore
@@ -299,7 +387,7 @@ async function enablePush() {
 async function disableLocalNotifs() {
   try {
     const LN = window.__hbPlugin("LocalNotifications");
-    await LN.cancel({ notifications: LOCAL_SLOTS.map((s) => ({ id: s.id })) });
+    await LN.cancel({ notifications: LOCAL_SLOT_TIMES.map((s) => ({ id: s.id })) });
     toast("Notifications turned off.");
   } catch (e) { toast(e.message); }
 }

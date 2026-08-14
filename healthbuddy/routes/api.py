@@ -258,18 +258,35 @@ def onboarding():
 @api.post("/onboarding/preview")
 @require_auth
 def onboarding_preview():
-    """'Here's what your notifications will look like' — shown on the last
-    onboarding screen, built from the answers the user just picked (not yet
-    saved) plus whatever real home-screen data already exists for them today.
-    Doesn't require onboarded=1, unlike /nudges/next."""
+    """'Here's what your notifications will look like.' Two callers:
+      1. The last onboarding screen, BEFORE the user's answers are saved —
+         pass gender/occupation/health_goals/period_care_enabled in the body.
+      2. Profile's 'Enable notifications' toggle, for an ALREADY-onboarded
+         user — call with an empty body; everything below falls back to
+         their saved profile + today's real home-screen data automatically,
+         which is exactly what the native build schedules on-device
+         (see enableLocalNotifs() in app.js)."""
     data = body()
-    occupation, gender = data.get("occupation"), data.get("gender")
+    # NOTE: relative to routes/api.py, the services package is ../services,
+    # not . (routes has no context/cycle modules of its own).
+    from ..services import context as context_svc
+    ctx = context_svc.build(g.user["id"])
+
+    occupation = data.get("occupation") or (ctx["profile"]["occupation"] if ctx else None)
+    gender = data.get("gender") or (ctx["profile"]["gender"] if ctx else None)
     goals = data.get("health_goals") or ([data.get("health_goal")] if data.get("health_goal") else [])
     goals = [str(x).strip() for x in goals if x]
-    period_care_enabled = bool(data.get("period_care_enabled")) and gender == "female"
+    if not goals and ctx:
+        goals = ctx["profile"]["health_goals"]
 
-    from . import context as context_svc  # local import avoids a cycle at module load
-    ctx = context_svc.build(g.user["id"])
+    period_care_raw = data.get("period_care_enabled")
+    # ctx["cycle"] is only ever non-None when the user has actually opted
+    # into Period Care (services/cycle.py 404s/returns None otherwise), so
+    # it's a safe fallback signal when the client doesn't pass the flag.
+    period_care_enabled = (bool(period_care_raw) if period_care_raw is not None
+                            else bool(ctx and ctx["cycle"]))
+    period_care_enabled = period_care_enabled and gender == "female"
+
     stats = {}
     if ctx:
         stats = {
@@ -280,19 +297,14 @@ def onboarding_preview():
             "meal_logs_today": ctx["today"]["meals"],
             "sleep_hours_last_night": ctx["today"]["sleep_hours"],
             "mood_streak_days": gamification.streak(g.user["id"], "mood"),
-            "activity_level": data.get("activity_level"),
+            "activity_level": data.get("activity_level") or ctx["profile"]["activity_level"],
         }
-    cycle_phase = None
-    if period_care_enabled:
-        try:
-            from . import cycle as cycle_svc
-            cycle_phase = cycle_svc.status(g.user["id"]).get("phase")
-        except LookupError:
-            pass
+    cycle_phase = (ctx["cycle"].get("phase") if (period_care_enabled and ctx and ctx["cycle"]) else None)
 
     result = notification_preview.preview(
         gender=gender, occupation=occupation, goals=goals, stats=stats,
         period_care_enabled=period_care_enabled, cycle_phase=cycle_phase,
+        count=data.get("count", notification_preview.DEFAULT_DAILY_NOTIFICATIONS),
     )
     return jsonify(result)
 
